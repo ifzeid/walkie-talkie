@@ -5,10 +5,10 @@ Signing remains on this Mac. No private key is exported or sent to GitHub.
 The draft is made public only after both the archive and appcast are uploaded.
 """
 import argparse
-import os
 import plistlib
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,15 +51,17 @@ def main():
     for field in ('CFBundleShortVersionString', 'CFBundleVersion', 'SUPublicEDKey', 'SUFeedURL'):
         if built.get(field) != info.get(field):
             raise SystemExit(f'Build configuration differs from committed source: {field}')
-    output = ROOT / 'Releases' / version
+    # Retries can rebuild a byte-different ZIP before any version is public.
+    # Keep each attempt separate; never overwrite previously prepared files.
+    releases_directory = ROOT / 'Releases'
+    releases_directory.mkdir(exist_ok=True)
+    output = Path(tempfile.mkdtemp(prefix=f'{version}-', dir=releases_directory))
     run('python3', 'Scripts/prepare-release.py', '--output', str(output),
         '--notes', str(notes), '--download-prefix', f'https://github.com/{args.repo}/releases/download/{tag}/')
     archive = output / f'Walkie-Talkie-{version}.zip'
     appcast = output / 'appcast.xml'
-    env = os.environ.copy()
-    env.setdefault('DEVELOPER_DIR', '/Library/Developer/CommandLineTools')
-    subprocess.run(['swift', 'Scripts/VerifyUpdate.swift', 'dist/对讲机.app/Contents/Info.plist', str(appcast), str(archive)],
-                   cwd=ROOT, env=env, check=True)
+    # prepare-release verifies this exact archive with the bundled public key
+    # and rejects a tampered copy before writing appcast.xml.
     if run('git', 'status', '--porcelain', capture=True).strip():
         raise SystemExit('The build changed tracked files. Commit them and rebuild before publishing.')
     # Create the tag only after the final signed archive has passed verification.

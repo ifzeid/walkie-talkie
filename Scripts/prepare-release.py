@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Prepare signed Sparkle files locally; never uploads or publishes."""
+"""Prepare and verify a signed Sparkle release locally; never uploads private keys."""
 import argparse
+import base64
+from datetime import datetime, timezone
+from email.utils import format_datetime
+import html
+import os
 import plistlib
 import shutil
 import subprocess
+import tempfile
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 from urllib.parse import urlparse
@@ -25,23 +32,66 @@ with zipfile.ZipFile(archive) as bundle:
     info = plistlib.loads(bundle.read(candidates[0]))
     if info.get('CFBundleIdentifier') != 'app.walkietalkie.translator':
         raise SystemExit('Archive belongs to a different application')
+    # Detect architecture from this archive, not from an unrelated local app.
+    binary_name = candidates[0].removesuffix('Info.plist') + 'MacOS/' + info['CFBundleExecutable']
+    with tempfile.TemporaryDirectory(prefix='walkie-release-arch-') as temporary:
+        binary = Path(temporary) / 'WalkieTalkie'
+        binary.write_bytes(bundle.read(binary_name))
+        architectures = subprocess.check_output(['lipo', '-archs', str(binary)], text=True).split()
 version = info['CFBundleShortVersionString']
-if not all(ch.isdigit() or ch == '.' for ch in version):
+if not version or not all(ch.isdigit() or ch == '.' for ch in version):
     raise SystemExit('Expected a numeric release version')
-tools = root / '.build/artifacts/sparkle/Sparkle/bin'
-account = 'app.walkietalkie.translator.updates'
-public_key = subprocess.check_output([str(tools / 'generate_keys'), '--account', account, '-p'], text=True, timeout=30).strip()
-if public_key != info.get('SUPublicEDKey'):
-    raise SystemExit('The app verification key does not match this Mac’s update signing key')
 output = args.output.resolve()
 output.mkdir(parents=True, exist_ok=True)
 destination = output / f'Walkie-Talkie-{version}.zip'
 if destination.exists() and destination.read_bytes() != archive.read_bytes():
-    raise SystemExit('An archive with this version already exists. Increase both app version and build number before publishing again.')
+    raise SystemExit('An archive with this version already exists. Increase both version numbers before publishing again.')
 shutil.copy2(archive, destination)
+# Use a single official signing tool for all releases. Avoid requiring separate
+# Keychain authorization for generate_keys, generate_appcast and sign_update.
+tool = root / '.build/artifacts/sparkle/Sparkle/bin/sign_update'
+try:
+    signature = subprocess.check_output([str(tool), '--account', 'app.walkietalkie.translator.updates',
+                                         '-p', str(destination)], text=True, timeout=120).strip()
+except subprocess.TimeoutExpired:
+    raise SystemExit('Signing is waiting for macOS Keychain authorization. Authorize sign_update in the system dialog, then retry.')
+if len(base64.b64decode(signature, validate=True)) != 64:
+    raise SystemExit('Signing tool returned an invalid Ed25519 signature')
+ns = 'http://www.andymatuschak.org/xml-namespaces/sparkle'
+ET.register_namespace('sparkle', ns)
+rss = ET.Element('rss', {'version': '2.0'})
+channel = ET.SubElement(rss, 'channel')
+ET.SubElement(channel, 'title').text = '对讲机 · Walkie Talkie'
+ET.SubElement(channel, 'link').text = info.get('SUFeedURL', args.download_prefix)
+ET.SubElement(channel, 'description').text = '对讲机版本更新'
+ET.SubElement(channel, 'language').text = 'zh-CN'
+item = ET.SubElement(channel, 'item')
+ET.SubElement(item, 'title').text = f'对讲机 {version}'
+ET.SubElement(item, 'pubDate').text = format_datetime(datetime.now(timezone.utc), usegmt=True)
+ET.SubElement(item, f'{{{ns}}}version').text = info['CFBundleVersion']
+ET.SubElement(item, f'{{{ns}}}shortVersionString').text = version
+ET.SubElement(item, f'{{{ns}}}minimumSystemVersion').text = info['LSMinimumSystemVersion']
+if architectures == ['arm64']:
+    ET.SubElement(item, f'{{{ns}}}hardwareRequirements').text = 'arm64'
 if args.notes:
-    shutil.copy2(args.notes, destination.with_suffix('.md'))
-subprocess.run([str(tools / 'generate_appcast'), '--account', account,
-                '--download-url-prefix', args.download_prefix.rstrip('/') + '/',
-                '--embed-release-notes', '--maximum-deltas', '0', '--maximum-versions', '0', str(output)], check=True, timeout=120)
-print(f'Ready to upload: {destination.name} and appcast.xml in {output}')
+    content = html.escape(args.notes.read_text())
+    ET.SubElement(item, 'description').text = f'<div style="white-space:pre-wrap;font:13px -apple-system">{content}</div>'
+ET.SubElement(item, 'enclosure', {
+    'url': args.download_prefix.rstrip('/') + '/' + destination.name,
+    'type': 'application/octet-stream',
+    'length': str(destination.stat().st_size),
+    f'{{{ns}}}edSignature': signature,
+})
+ET.indent(rss)
+# Never leave an unverified appcast as the publishable file.
+with tempfile.TemporaryDirectory(prefix='walkie-release-verify-') as temporary:
+    candidate = Path(temporary) / 'appcast.xml'
+    ET.ElementTree(rss).write(candidate, encoding='utf-8', xml_declaration=True)
+    info_path = Path(temporary) / 'Info.plist'
+    info_path.write_bytes(plistlib.dumps(info))
+    env = os.environ.copy()
+    env.setdefault('DEVELOPER_DIR', '/Library/Developer/CommandLineTools')
+    subprocess.run(['swift', str(root / 'Scripts/VerifyUpdate.swift'), str(info_path), str(candidate), str(destination)],
+                   env=env, check=True)
+    shutil.copy2(candidate, output / 'appcast.xml')
+print(f'Verified release: {destination.name} and appcast.xml in {output}')
