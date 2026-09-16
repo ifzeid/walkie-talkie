@@ -1,0 +1,12 @@
+.build/
+dist/
+.DS_Store
+.swiftpm/
+Releases/
+*.pem
+*.p12
+*.key
+.env
+.env.*
+__pycache__/
+*.pyc
